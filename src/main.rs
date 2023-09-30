@@ -1,9 +1,10 @@
-use std::{env, process, ptr, ptr::NonNull, mem::MaybeUninit, path::Path, ffi::CString, sync::{Arc, Mutex}};
+use std::{env, process, ptr, ptr::NonNull, mem::MaybeUninit, ffi::CString, sync::{Arc, Mutex}, intrinsics::copy_nonoverlapping};
 use libvmaf_sys::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
-use os_str_bytes::OsStrBytes;
+use log;
+use env_logger;
 
 const WIDTH: usize = 960;
 const HEIGHT: usize = 540;
@@ -25,20 +26,23 @@ impl ShareableVmafContext {
 unsafe impl Send for ShareableVmafContext { }
 
 fn main() {
+    env_logger::init();
     unsafe { unsafe_main() }
 }
 
 unsafe fn unsafe_main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: {} <input video path> <output path> <video encoder> <audio encoder>", args[0]);
+        eprintln!("Usage: {} <input video path>", args[0]);
         process::exit(1);
     }
     let input_path = &args[1];
 
     gst::init().expect("Failed to gstreamer initialization");
 
-    let vmaf_conf: VmafConfiguration = MaybeUninit::zeroed().assume_init();
+    let mut vmaf_conf: VmafConfiguration = MaybeUninit::zeroed().assume_init();
+    vmaf_conf.log_level = VmafLogLevel::VMAF_LOG_LEVEL_DEBUG;
+    vmaf_conf.n_threads = 16;
     let mut vmaf_ctx: *mut VmafContext = ptr::null_mut();
     let vmaf_ctx_ptr: *mut *mut VmafContext = &mut vmaf_ctx;
     vmaf_init(vmaf_ctx_ptr, vmaf_conf);
@@ -48,13 +52,12 @@ unsafe fn unsafe_main() {
     let mut vmaf_model: *mut VmafModel = ptr::null_mut();
     let vmaf_model_ptr: *mut *mut VmafModel = &mut vmaf_model;
 
-    let model_path = Path::new("todo");
-    let model_path_cstr = CString::new(model_path.as_os_str().to_raw_bytes()).unwrap();
-    vmaf_model_load_from_path(vmaf_model_ptr, vmaf_model_conf_ptr, model_path_cstr.as_ptr());
+    let model_version_cstr = CString::new("vmaf_v0.6.1").unwrap();
+    vmaf_model_load(vmaf_model_ptr, vmaf_model_conf_ptr, model_version_cstr.as_ptr());
 
     vmaf_use_features_from_model(vmaf_ctx, vmaf_model);
 
-    let pipeline_def = format!("filesrc location={} ! decodebin ! videoconvert ! videoscale ! video/x-raw,format=I420 ! appsink name=out", input_path);
+    let pipeline_def = format!("filesrc location={} ! decodebin force-sw-decoders=true ! videoconvert ! videoscale ! video/x-raw,format=I420,width={},height={} ! appsink name=out", input_path, WIDTH, HEIGHT);
     let pipeline = gst::parse_launch(&pipeline_def).expect("Failed pipeline parse");
     let appsink = pipeline.dynamic_cast_ref::<gst::Bin>().expect("Couldn't cast pipeline to bin")
         .by_name("out").expect("Couldn't get AppSink element")
@@ -67,6 +70,7 @@ unsafe fn unsafe_main() {
     let count_weak = Arc::downgrade(&count);
 
     let callbacks = gst_app::app_sink::AppSinkCallbacks::builder().new_sample(move |appsink| {
+        log::debug!("New sample arrived");
         let (Some(vmaf_ctx), Some(count)) = (vmaf_ctx_weak.upgrade(), count_weak.upgrade()) else {
             return Err(gst::FlowError::CustomError);
         };
@@ -89,12 +93,19 @@ unsafe fn unsafe_main() {
         // 一旦同じ画像を比較するだけ
         // ここでちゃんと動いたら tee してやるサンプルも作る
 
-        pic_ref.data[0] = data[0..res].as_ptr() as *mut _;
-        pic_ref.data[1] = data[res..res*2].as_ptr() as *mut _;
-        pic_ref.data[2] = data[res*2..res*3].as_ptr() as *mut _;
-        pic_dist.data[0] = data[0..res].as_ptr() as *mut _;
-        pic_dist.data[1] = data[res..res*2].as_ptr() as *mut _;
-        pic_dist.data[2] = data[res*2..res*3].as_ptr() as *mut _;
+        assert_eq!(data.len(), res + (res / 4) * 2);
+
+        let y_data = &data[0         .. res      ];
+        let u_data = &data[(res)/2   .. (res*2)/2];
+        let v_data = &data[(res*2)/2 .. (res*2)/2];
+
+        copy_nonoverlapping(y_data.as_ptr() as *const _, pic_ref.data[0], y_data.len());
+        copy_nonoverlapping(u_data.as_ptr() as *const _, pic_ref.data[1], u_data.len());
+        copy_nonoverlapping(v_data.as_ptr() as *const _, pic_ref.data[2], v_data.len());
+        copy_nonoverlapping(y_data.as_ptr() as *const _, pic_dist.data[0], y_data.len());
+        copy_nonoverlapping(u_data.as_ptr() as *const _, pic_dist.data[1], u_data.len());
+        copy_nonoverlapping(v_data.as_ptr() as *const _, pic_dist.data[2], v_data.len());
+
         {
             let vmaf_ctx = vmaf_ctx.lock().unwrap();
             let mut count = count.lock().unwrap();
@@ -131,10 +142,14 @@ unsafe fn unsafe_main() {
         let vmaf_ctx = vmaf_ctx.lock().unwrap();
         let count = count.lock().unwrap();
 
+        log::debug!("Total vmaf count: {}", *count);
         let mut score: f64 = 0.0f64;
         let score_ptr: *mut f64 = &mut score;
-        vmaf_score_pooled(
-            vmaf_ctx.as_ptr(), vmaf_model, VmafPoolingMethod::VMAF_POOL_METHOD_HARMONIC_MEAN, score_ptr, 0, *count);
+
+        // flushing
+        vmaf_read_pictures(vmaf_ctx.as_ptr(), ptr::null_mut(), ptr::null_mut(), 0);
+
+        vmaf_score_pooled(vmaf_ctx.as_ptr(), vmaf_model, VmafPoolingMethod::VMAF_POOL_METHOD_HARMONIC_MEAN, score_ptr, 0, *count - 2);
         vmaf_close(vmaf_ctx.as_ptr());
         println!("VMAF = {}", score);
     }

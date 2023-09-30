@@ -1,3 +1,9 @@
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+
 /target
 gibo 2.2.8 by Simon Whitaker
 https://github.com/simonwhitaker/gibo

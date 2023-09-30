@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+env_logger = "0.10.0"
 gstreamer = "0.21.0"
 gstreamer-app = "0.21.0"
-libvmaf-sys = "0.3.6"
-os_str_bytes = "6.5.1"
+libvmaf-sys = { path = "./libvmaf-sys" }
+log = "0.4.20"
